@@ -40,6 +40,7 @@ import (
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/oauth2"
 )
@@ -284,6 +285,18 @@ copy are already shared between them. Additionally, it should also function for 
 has access permissions both between Onedrive for *business* and *SharePoint* under the *same
 tenant*, and between *SharePoint* and another *SharePoint* under the *same tenant*. In other
 cases, rclone will fall back to normal copy (which will be slightly slower).`,
+			Advanced: true,
+		}, {
+			Name: "use_content_stream",
+			Help: `Download files directly through Microsoft Graph's beta contentStream API.
+
+This avoids pre-authenticated download URLs and can work around HTTP 401
+errors from OneDrive's content servers. This affects downloads only.
+
+The beta API is subject to change. This option requires Microsoft Graph
+authentication and cannot be used with tenant_url. If the server ignores
+byte ranges, seeking downloads and discards the preceding bytes.`,
+			Default:  false,
 			Advanced: true,
 		}, {
 			Name:     "list_chunk",
@@ -831,6 +844,7 @@ type Options struct {
 	ExposeOneNoteFiles      bool                 `config:"expose_onenote_files"`
 	ServerSideAcrossConfigs bool                 `config:"server_side_across_configs"`
 	ListChunk               int64                `config:"list_chunk"`
+	UseContentStream        bool                 `config:"use_content_stream"`
 	NoVersions              bool                 `config:"no_versions"`
 	HardDelete              bool                 `config:"hard_delete"`
 	LinkScope               string               `config:"link_scope"`
@@ -2633,9 +2647,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 
 	fs.FixRangeOption(options, o.size)
-	// Only malware-flagged files use Graph beta; clean files stay on stable v1.0.
 	if o.fs.opt.AVOverride && o.fs.opt.TenantURL == "" && o.malwareDetected() {
 		return o.openInfected(ctx, options...)
+	}
+	if o.fs.opt.UseContentStream {
+		if o.fs.opt.TenantURL != "" {
+			return nil, errors.New("use_content_stream requires Microsoft Graph authentication; tenant_url must be empty")
+		}
+		return o.openContentStream(ctx, options...)
 	}
 	opts := o.fs.newOptsCall(o.id, "GET", "/content")
 	opts.Options = options
@@ -2679,9 +2698,9 @@ func (o *Object) openContentStream(ctx context.Context, options ...fs.OpenOption
 		RootURL: graphAPIEndpoint[o.fs.opt.Region] + "/beta/drives/" + drive,
 		Path:    "/items/" + id + "/contentStream",
 		Options: options,
-		ExtraHeaders: map[string]string{
-			"Prefer": "forceInfectedDownload",
-		},
+	}
+	if o.fs.opt.AVOverride && o.malwareDetected() {
+		opts.ExtraHeaders = map[string]string{"Prefer": "forceInfectedDownload"}
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
@@ -2693,7 +2712,27 @@ func (o *Object) openContentStream(ctx context.Context, options ...fs.OpenOption
 	if resp.StatusCode == http.StatusOK && resp.ContentLength > 0 && resp.Header.Get("Content-Range") == "" {
 		o.size = resp.ContentLength
 	}
-	return resp.Body, nil
+	// Some Personal drives ignore Range on contentStream and return the whole file.
+	if resp.StatusCode == http.StatusOK && resp.Header.Get("Content-Range") == "" {
+		for _, option := range options {
+			key, value := option.Header()
+			if !strings.EqualFold(key, "Range") {
+				continue
+			}
+			requested, err := fs.ParseRangeOption(value)
+			if err != nil {
+				_ = resp.Body.Close()
+				return nil, err
+			}
+			offset, limit := requested.Decode(o.size)
+			if _, err = io.CopyN(io.Discard, resp.Body, offset); err != nil {
+				_ = resp.Body.Close()
+				return nil, err
+			}
+			return readers.NewLimitedReadCloser(resp.Body, limit), nil
+		}
+	}
+	return o.checkRange(resp, options)
 }
 
 // openContentPrefer downloads via Graph beta /content with Prefer: forceInfectedDownload.
