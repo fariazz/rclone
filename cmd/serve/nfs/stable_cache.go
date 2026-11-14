@@ -53,6 +53,7 @@ func (c *stableCache) handle(name string) []byte {
 	return h
 }
 
+// ToHandle returns a process-lifetime identity for a filesystem name.
 func (c *stableCache) ToHandle(_ billy.Filesystem, parts []string) []byte {
 	c.namespace.RLock()
 	defer c.namespace.RUnlock()
@@ -63,6 +64,7 @@ func (c *stableCache) ToHandle(_ billy.Filesystem, parts []string) []byte {
 	return c.handle(name)
 }
 
+// FromHandle returns an opaque path resolved when the filesystem operation runs.
 func (c *stableCache) FromHandle(h []byte) (billy.Filesystem, []string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -77,7 +79,9 @@ func (c *stableCache) FromHandle(h []byte) (billy.Filesystem, []string, error) {
 // part of the mutation. go-nfs also calls this after a successful rename,
 // when invalidating the source handle would break open files.
 func (c *stableCache) InvalidateHandle(_ billy.Filesystem, _ []byte) error { return nil }
-func (c *stableCache) HandleLimit() int                                    { return math.MaxInt }
+
+// HandleLimit reports that live identities are never evicted.
+func (c *stableCache) HandleLimit() int { return math.MaxInt }
 
 func pathWithin(name, parent string) bool {
 	return name == parent || strings.HasPrefix(name, parent+"/")

@@ -12,6 +12,7 @@ import (
 // upload still follows the configured write-back delay.
 type syncFile struct{ vfs.Handle }
 
+// Close syncs cached data and closes the handle even if syncing fails.
 func (f *syncFile) Close() error {
 	syncErr := f.Handle.Sync()
 	closeErr := f.Handle.Close()
