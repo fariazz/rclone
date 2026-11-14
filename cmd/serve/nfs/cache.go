@@ -62,6 +62,8 @@ func (h *Handler) getCache() (c Cache, err error) {
 	fs.Debugf("nfs", "Starting %v handle cache", h.opt.HandleCache)
 	var inner Cache
 	switch h.opt.HandleCache {
+	case cacheStable:
+		inner = newStableCache(h.billyFS)
 	case cacheMemory:
 		inner = nfshelper.NewCachingHandler(h, h.opt.HandleLimit)
 	case cacheDisk:

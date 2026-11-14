@@ -3,6 +3,7 @@
 package nfs
 
 import (
+	"encoding/binary"
 	"os"
 	"path"
 	"strings"
@@ -25,7 +26,7 @@ import (
 // if your file system populates a [`syscall.Stat_t`](https://golang.org/pkg/syscall/#Stat_t)
 // concrete struct, the ownership specified in that object will be used.
 // It can also return a file.FileInfo which is easier to manage cross platform
-func setSys(fi os.FileInfo) {
+func (f *FS) setSys(fi os.FileInfo) {
 	node, ok := fi.(vfs.Node)
 	if !ok {
 		fs.Errorf(fi, "internal error: %T is not a vfs.Node", fi)
@@ -39,13 +40,17 @@ func setSys(fi os.FileInfo) {
 		GID:    vfs.Opt.GID,
 		Fileid: node.Inode(), // without this mounting doesn't work on Linux
 	}
+	if f.stable != nil {
+		stat.Fileid = binary.BigEndian.Uint64(f.stable.handle(node.Path())[8:])
+	}
 	node.SetSys(&stat)
 }
 
 // FS is our wrapper around the VFS to properly support billy.Filesystem interface
 type FS struct {
-	vfs  *vfs.VFS
-	root string // absolute path within the VFS this FS is rooted at; empty means VFS root
+	vfs    *vfs.VFS
+	stable *stableCache
+	root   string // absolute path within the VFS this FS is rooted at; empty means VFS root
 }
 
 // fullPath returns the absolute path within the VFS for name, which is
@@ -60,69 +65,126 @@ func (f *FS) fullPath(name string) string {
 // subFS returns a new *FS rooted at root within the VFS. root must already
 // be a cleaned absolute path that the caller has validated as a directory.
 func (f *FS) subFS(root string) *FS {
-	return &FS{vfs: f.vfs, root: root}
+	return &FS{vfs: f.vfs, root: root, stable: f.stable}
 }
 
 // ReadDir implements read dir
 func (f *FS) ReadDir(p string) (dir []os.FileInfo, err error) {
-	p = f.fullPath(p)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	p, err = f.resolvePath(p)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(p, "")("items=%d, err=%v", &dir, &err)
 	dir, err = f.vfs.ReadDir(p)
 	if err != nil {
 		return nil, err
 	}
 	for _, fi := range dir {
-		setSys(fi)
+		f.setSys(fi)
 	}
 	return dir, nil
 }
 
 // Create implements creating new files
 func (f *FS) Create(filename string) (node billy.File, err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
-	return f.vfs.Create(filename)
+	handle, err := f.vfs.Create(filename)
+	if err != nil {
+		return nil, err
+	}
+	return &syncFile{Handle: handle}, nil
 }
 
 // Open opens a file
 func (f *FS) Open(filename string) (node billy.File, err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
 	return f.vfs.Open(filename)
 }
 
 // OpenFile opens a file
 func (f *FS) OpenFile(filename string, flag int, perm os.FileMode) (node billy.File, err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(filename, "flag=0x%X, perm=%v", flag, perm)("%v, err=%v", &node, &err)
-	return f.vfs.OpenFile(filename, flag, perm)
+	handle, err := f.vfs.OpenFile(filename, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
+		return &syncFile{Handle: handle}, nil
+	}
+	return handle, nil
 }
 
 // Stat gets the file stat
 func (f *FS) Stat(filename string) (fi os.FileInfo, err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
 	fi, err = f.vfs.Stat(filename)
 	if err != nil {
 		return nil, err
 	}
-	setSys(fi)
+	f.setSys(fi)
 	return fi, nil
 }
 
 // Rename renames a file
 func (f *FS) Rename(oldpath, newpath string) (err error) {
-	oldpath = f.fullPath(oldpath)
-	newpath = f.fullPath(newpath)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	oldpath, err = f.resolvePath(oldpath)
+	if err != nil {
+		return err
+	}
+	newpath, err = f.resolvePath(newpath)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
-	return f.vfs.Rename(oldpath, newpath)
+	mutate := func() error { return f.vfs.Rename(oldpath, newpath) }
+	if f.stable != nil {
+		return f.stable.rename(oldpath, newpath, mutate)
+	}
+	return mutate()
 }
 
 // Remove deletes a file
 func (f *FS) Remove(filename string) (err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(filename, "")("err=%v", &err)
-	return f.vfs.Remove(filename)
+	mutate := func() error { return f.vfs.Remove(filename) }
+	if f.stable != nil {
+		return f.stable.remove(filename, mutate)
+	}
+	return mutate()
 }
 
 // Join joins path elements
@@ -140,7 +202,12 @@ func (f *FS) TempFile(dir, prefix string) (node billy.File, err error) {
 // it does not redirect to VFS.MkDirAll because that one doesn't
 // honor the permissions
 func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(filename, "perm=%v", perm)("err=%v", &err)
 	parts := strings.Split(filename, "/")
 	for i := range parts {
@@ -158,33 +225,53 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
 
 // Lstat gets the stats for symlink
 func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
-	filename = f.fullPath(filename)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	filename, err = f.resolvePath(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
 	fi, err = f.vfs.Stat(filename)
 	if err != nil {
 		return nil, err
 	}
-	setSys(fi)
+	f.setSys(fi)
 	return fi, nil
 }
 
 // Symlink creates a link pointing to target
 func (f *FS) Symlink(target, link string) (err error) {
-	link = f.fullPath(link)
+	unlock := f.lockNamespace(true)
+	defer unlock()
+	link, err = f.resolvePath(link)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(target, "link=%q", link)("err=%v", &err)
 	return f.vfs.Symlink(target, link)
 }
 
 // Readlink reads the contents of link
 func (f *FS) Readlink(link string) (result string, err error) {
-	link = f.fullPath(link)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	link, err = f.resolvePath(link)
+	if err != nil {
+		return "", err
+	}
 	defer log.Trace(link, "")("result=%q, err=%v", &result, &err)
 	return f.vfs.Readlink(link)
 }
 
 // Chmod changes the file modes
 func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
-	name = f.fullPath(name)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	name, err = f.resolvePath(name)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(name, "mode=%v", mode)("err=%v", &err)
 	err = f.vfs.Chmod(name, mode)
 	// Mask Chmod not implemented
@@ -202,7 +289,12 @@ func (f *FS) Lchown(name string, uid, gid int) (err error) {
 
 // Chown changes owner of the file
 func (f *FS) Chown(name string, uid, gid int) (err error) {
-	name = f.fullPath(name)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	name, err = f.resolvePath(name)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(name, "uid=%d, gid=%d", uid, gid)("err=%v", &err)
 	err = f.vfs.Chown(name, uid, gid)
 	// Mask Chown not implemented
@@ -214,7 +306,12 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
 
 // Chtimes changes the access time and modified time
 func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
-	name = f.fullPath(name)
+	unlock := f.lockNamespace(false)
+	defer unlock()
+	name, err = f.resolvePath(name)
+	if err != nil {
+		return err
+	}
 	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)
 	return f.vfs.Chtimes(name, atime, mtime)
 }
@@ -249,3 +346,26 @@ var (
 	_ billy.Filesystem = (*FS)(nil)
 	_ billy.Change     = (*FS)(nil)
 )
+
+// lockNamespace prevents name reuse between resolving a handle and opening
+// its VFS node. The lock is released before file reads and writes themselves.
+func (f *FS) lockNamespace(exclusive bool) func() {
+	if f.stable == nil {
+		return func() {}
+	}
+	if exclusive {
+		f.stable.namespace.Lock()
+		return f.stable.namespace.Unlock
+	}
+	f.stable.namespace.RLock()
+	return f.stable.namespace.RUnlock
+}
+
+// resolvePath requires the namespace lock when the stable cache is enabled.
+func (f *FS) resolvePath(name string) (string, error) {
+	name = f.fullPath(name)
+	if f.stable == nil {
+		return name, nil
+	}
+	return f.stable.resolveName(name)
+}

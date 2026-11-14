@@ -54,6 +54,7 @@ const (
 	cacheMemory handleCache = iota
 	cacheDisk
 	cacheSymlink
+	cacheStable
 )
 
 type handleCacheChoices struct{}
@@ -63,6 +64,7 @@ func (handleCacheChoices) Choices() []string {
 		cacheMemory:  "memory",
 		cacheDisk:    "disk",
 		cacheSymlink: "symlink",
+		cacheStable:  "stable",
 	}
 }
 
@@ -171,6 +173,14 @@ default this is |memory| where new handles will be randomly allocated
 when needed. These are stored in memory. If the server is restarted
 the handle cache will be lost and connected NFS clients will get stale
 handle errors.
+
+|--nfs-cache-type stable| retains in-memory handles across file and directory
+renames made through this server. Replacing or deleting a name invalidates
+its previous identity. Handles and file IDs remain stable when the VFS
+directory cache is refreshed. This cache is never evicted and grows with
+the number of names accessed; |--nfs-cache-handle-limit| does not apply.
+Restarting the server invalidates all handles. Changes made outside this
+server are subject to VFS directory-cache consistency limits.
 
 |--nfs-cache-type disk| uses an on disk NFS handle cache. Rclone
 hashes the path of the object and stores it in a file named after the
